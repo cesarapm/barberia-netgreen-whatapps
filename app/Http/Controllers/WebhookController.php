@@ -42,40 +42,44 @@ class WebhookController extends Controller
             return response()->json(['status' => 'ignored'], 200);
         }
 
-        // Obtener o crear contacto
-        $contact = Contact::firstOrCreate(['phone' => $from]);
+        // Responde de inmediato al webhook y deja la persistencia/broadcast para después.
+        dispatch(function () use ($from, $body, $twilioSid) {
+            // Obtener o crear contacto
+            $contact = Contact::firstOrCreate(['phone' => $from]);
 
-        // Obtener o crear conversación activa
-        $conversation = Conversation::firstOrCreate(
-            ['contact_id' => $contact->id, 'status' => 'active'],
-            ['is_human' => false]
-        );
+            // Obtener o crear conversación activa
+            $conversation = Conversation::firstOrCreate(
+                ['contact_id' => $contact->id, 'status' => 'active'],
+                ['is_human' => false]
+            );
 
-        // Guardar el mensaje entrante
-        $message = Message::create([
-            'conversation_id' => $conversation->id,
-            'body'            => $body,
-            'direction'       => 'inbound',
-            'sender_type'     => 'user',
-            'twilio_sid'      => $twilioSid,
-        ]);
+            // Guardar el mensaje entrante
+            $message = Message::create([
+                'conversation_id' => $conversation->id,
+                'body'            => $body,
+                'direction'       => 'inbound',
+                'sender_type'     => 'user',
+                'twilio_sid'      => $twilioSid,
+            ]);
 
-        // Emitir por WebSocket al front
-        broadcast(new MessageReceived($message));
+            // Emitir por WebSocket al front
+            broadcast(new MessageReceived($message));
 
-        $quotaSnapshot = $messageQuota->snapshot();
-        $messageQuota->notifyIfChanged($quotaSnapshot);
+            $messageQuota = app(MessageQuotaService::class);
+            $newQuotaSnapshot = $messageQuota->snapshot();
+            $messageQuota->notifyIfChanged($newQuotaSnapshot);
 
-        Log::info('Mensaje guardado', [
-            'contact'      => $from,
-            'conversation' => $conversation->id,
-            'is_human'     => $conversation->is_human,
-        ]);
+            Log::info('Mensaje guardado', [
+                'contact'      => $from,
+                'conversation' => $conversation->id,
+                'is_human'     => $conversation->is_human,
+            ]);
+        })->afterResponse();
 
         return response()->json([
             'status'      => 'ok',
-            'is_human'    => $conversation->is_human,
-            'conversation_id' => $conversation->id,
+            'queued'      => true,
+            'conversation_id' => $conversationId,
             'quota' => $quotaSnapshot,
         ], 200);
     }
@@ -86,42 +90,114 @@ class WebhookController extends Controller
      */
     public function storeOutbound(Request $request, MessageQuotaService $messageQuota)
     {
-
-        $quotaSnapshot = $messageQuota->snapshot();
-        $messageQuota->notifyIfChanged($quotaSnapshot);
-
-        if ($messageQuota->isBlocked($quotaSnapshot)) {
-            return response()->json([
-                'status' => 'blocked',
-                ...$messageQuota->blockedPayload($quotaSnapshot),
-            ], 429);
+        $rawPayload = $request->all();
+        $payload = $request->input('body');
+        if (!is_array($payload)) {
+            $payload = $request->all();
         }
 
+        $conversationToken = trim((string) ($payload['conversation_id'] ?? ''));
 
-    Log::info('Webhook outbound received', $request->all());
-        $validated = $request->validate([
-            'conversation_id' => 'required|exists:conversations,id',
-            'body'            => 'required|string',
-            'twilio_sid'      => 'nullable|string',
-        ]);
+        dispatch(function () use ($payload, $rawPayload) {
+            Log::info('Webhook outbound received', $rawPayload);
 
-        $message = Message::create([
-            'conversation_id' => $validated['conversation_id'],
-            'body'            => $validated['body'],
-            'direction'       => 'outbound',
-            'sender_type'     => 'bot',
-            'twilio_sid'      => $validated['twilio_sid'] ?? null,
-        ]);
+            $messageQuota = app(MessageQuotaService::class);
+            $quotaSnapshot = $messageQuota->snapshot();
+            $messageQuota->notifyIfChanged($quotaSnapshot);
 
-        broadcast(new MessageReceived($message));
+            if ($messageQuota->isBlocked($quotaSnapshot)) {
+                Log::warning('Outbound bloqueado por cuota', [
+                    'conversation_id' => $payload['conversation_id'] ?? null,
+                ]);
+                return;
+            }
 
-        $quotaSnapshot = $messageQuota->snapshot();
-        $messageQuota->notifyIfChanged($quotaSnapshot);
+            $validated = validator($payload, [
+                'conversation_id' => 'required|string',
+                'body'            => 'required|string',
+                'twilio_sid'      => 'nullable|string',
+            ])->validate();
+
+            $conversationToken = trim((string) $validated['conversation_id']);
+            $messageBody = $validated['body'];
+            $twilioSid = $validated['twilio_sid'] ?? null;
+
+            $conversation = null;
+            if (ctype_digit($conversationToken)) {
+                $conversation = Conversation::find((int) $conversationToken);
+            }
+
+            if (!$conversation) {
+                $parts = array_values(array_filter(explode('-', $conversationToken)));
+                foreach ($parts as $part) {
+                    $digits = preg_replace('/\D+/', '', $part);
+                    if (!$digits) {
+                        continue;
+                    }
+
+                    $candidates = ['+' . $digits, $digits];
+                    foreach ($candidates as $candidatePhone) {
+                        $contact = Contact::where('phone', $candidatePhone)->first();
+                        if (!$contact) {
+                            continue;
+                        }
+
+                        $conversation = Conversation::where('contact_id', $contact->id)
+                            ->where('status', 'active')
+                            ->latest('id')
+                            ->first();
+
+                        if (!$conversation) {
+                            $conversation = Conversation::where('contact_id', $contact->id)
+                                ->latest('id')
+                                ->first();
+                        }
+
+                        if ($conversation) {
+                            break 2;
+                        }
+                    }
+                }
+            }
+
+            if (!$conversation) {
+                $parts = array_values(array_filter(explode('-', $conversationToken)));
+                $fallbackPart = count($parts) > 0 ? $parts[count($parts) - 1] : $conversationToken;
+                $fallbackDigits = preg_replace('/\D+/', '', $fallbackPart);
+
+                if ($fallbackDigits) {
+                    $contact = Contact::firstOrCreate(['phone' => '+' . $fallbackDigits]);
+                    $conversation = Conversation::firstOrCreate(
+                        ['contact_id' => $contact->id, 'status' => 'active'],
+                        ['is_human' => false]
+                    );
+                }
+            }
+
+            if (!$conversation) {
+                Log::warning('Outbound ignorado: no se pudo resolver ni crear conversación', [
+                    'conversation_id' => $conversationToken,
+                    'twilio_sid' => $twilioSid,
+                ]);
+                return;
+            }
+
+            $message = Message::create([
+                'conversation_id' => $conversation->id,
+                'body'            => $messageBody,
+                'direction'       => 'outbound',
+                'sender_type'     => 'bot',
+                'twilio_sid'      => $twilioSid,
+            ]);
+
+            broadcast(new MessageReceived($message));
+        })->afterResponse();
 
         return response()->json([
             'status' => 'ok',
-            'message_id' => $message->id,
-            'quota' => $quotaSnapshot,
+            'queued' => true,
+            'conversation_id' => $conversationToken,
+            'quota' => null,
         ]);
     }
 }
