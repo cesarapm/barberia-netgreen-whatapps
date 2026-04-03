@@ -174,102 +174,44 @@ class WebhookController extends Controller
 
     /**
      * Recibe el mensaje de respuesta que generó la IA en n8n
-    * y lo guarda para mantener el hilo de la conversación.
+     * y lo guarda para mantener el hilo de la conversación.
      */
     public function storeOutbound(Request $request, MessageQuotaService $messageQuota)
     {
-        $rawPayload = $request->all();
-        $payload = $request->input('body');
-        if (!is_array($payload)) {
-            $payload = $request->all();
+        $payload = $request->all();
+
+        Log::info('Webhook outbound received', $payload);
+
+        // Control de cuota
+        $quotaSnapshot = $messageQuota->snapshot();
+        $messageQuota->notifyIfChanged($quotaSnapshot);
+
+        if ($messageQuota->isBlocked($quotaSnapshot)) {
+            return response()->json([
+                'status' => 'blocked',
+                ...$messageQuota->blockedPayload($quotaSnapshot),
+            ], 429);
         }
 
-        $conversationToken = trim((string) ($payload['conversation_id'] ?? ''));
+        $conversationId = $payload['conversation_id'] ?? null;
+        $messageBody    = $payload['body'] ?? null;
+        $twilioSid      = $payload['twilio_sid'] ?? null;
 
-        dispatch(function () use ($payload, $rawPayload) {
-            Log::info('Webhook outbound received', $rawPayload);
+        if (!$conversationId || !$messageBody) {
+            Log::warning('Outbound ignorado: faltan campos requeridos', $payload);
+            return response()->json(['status' => 'ignored', 'reason' => 'missing required fields'], 200);
+        }
 
-            $messageQuota = app(MessageQuotaService::class);
-            $quotaSnapshot = $messageQuota->snapshot();
-            $messageQuota->notifyIfChanged($quotaSnapshot);
+        $conversation = Conversation::find((int) $conversationId);
 
-            if ($messageQuota->isBlocked($quotaSnapshot)) {
-                Log::warning('Outbound bloqueado por cuota', [
-                    'conversation_id' => $payload['conversation_id'] ?? null,
-                ]);
-                return;
-            }
+        if (!$conversation) {
+            Log::warning('Outbound ignorado: conversación no encontrada', [
+                'conversation_id' => $conversationId,
+            ]);
+            return response()->json(['status' => 'ignored', 'reason' => 'conversation not found'], 200);
+        }
 
-            $validated = validator($payload, [
-                'conversation_id' => 'required|string',
-                'body'            => 'required|string',
-                'twilio_sid'      => 'nullable|string',
-            ])->validate();
-
-            $conversationToken = trim((string) $validated['conversation_id']);
-            $messageBody = $validated['body'];
-            $twilioSid = $validated['twilio_sid'] ?? null;
-
-            $conversation = null;
-            if (ctype_digit($conversationToken)) {
-                $conversation = Conversation::find((int) $conversationToken);
-            }
-
-            if (!$conversation) {
-                $parts = array_values(array_filter(explode('-', $conversationToken)));
-                foreach ($parts as $part) {
-                    $digits = preg_replace('/\D+/', '', $part);
-                    if (!$digits) {
-                        continue;
-                    }
-
-                    $candidates = ['+' . $digits, $digits];
-                    foreach ($candidates as $candidatePhone) {
-                        $contact = Contact::where('phone', $candidatePhone)->first();
-                        if (!$contact) {
-                            continue;
-                        }
-
-                        $conversation = Conversation::where('contact_id', $contact->id)
-                            ->where('status', 'active')
-                            ->latest('id')
-                            ->first();
-
-                        if (!$conversation) {
-                            $conversation = Conversation::where('contact_id', $contact->id)
-                                ->latest('id')
-                                ->first();
-                        }
-
-                        if ($conversation) {
-                            break 2;
-                        }
-                    }
-                }
-            }
-
-            if (!$conversation) {
-                $parts = array_values(array_filter(explode('-', $conversationToken)));
-                $fallbackPart = count($parts) > 0 ? $parts[count($parts) - 1] : $conversationToken;
-                $fallbackDigits = preg_replace('/\D+/', '', $fallbackPart);
-
-                if ($fallbackDigits) {
-                    $contact = Contact::firstOrCreate(['phone' => '+' . $fallbackDigits]);
-                    $conversation = Conversation::firstOrCreate(
-                        ['contact_id' => $contact->id, 'status' => 'active'],
-                        ['is_human' => false]
-                    );
-                }
-            }
-
-            if (!$conversation) {
-                Log::warning('Outbound ignorado: no se pudo resolver ni crear conversación', [
-                    'conversation_id' => $conversationToken,
-                    'twilio_sid' => $twilioSid,
-                ]);
-                return;
-            }
-
+        dispatch(function () use ($conversation, $messageBody, $twilioSid) {
             $message = Message::create([
                 'conversation_id' => $conversation->id,
                 'body'            => $messageBody,
@@ -278,14 +220,20 @@ class WebhookController extends Controller
                 'twilio_sid'      => $twilioSid,
             ]);
 
+            $conversation->update(['last_message_at' => now()]);
+
             broadcast(new MessageReceived($message));
+
+            Log::info('Mensaje outbound guardado', [
+                'conversation' => $conversation->id,
+                'twilio_sid'   => $twilioSid,
+            ]);
         })->afterResponse();
 
         return response()->json([
-            'status' => 'ok',
-            'queued' => true,
-            'conversation_id' => $conversationToken,
-            'quota' => null,
+            'status'          => 'ok',
+            'queued'          => true,
+            'conversation_id' => $conversation->id,
         ]);
     }
 }
